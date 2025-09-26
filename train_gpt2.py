@@ -47,6 +47,30 @@ def get_batch(split):
     return x, y
 
 
+class CausalMultiHeadAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attention = nn.Linear(config.n_embed, 3 * config.n_embed)
+        self.ns = config.n_head
+        self.register_buffer('tril', torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+        self.project = nn.Linear(config.n_embed, config.n_embed)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        qkv = self.attention(x) # (B, T, 3C)
+        q, k, v = qkv.split(C, dim = qkv.dim()-1)
+        q = q.view(B, T, self.ns, C // self.ns).transpose(1, 2)
+        k = k.view(B, T, self.ns, C // self.ns).transpose(1, 2)
+        v = v.view(B, T, self.ns, C // self.ns).transpose(1, 2)
+        qkT = q@k.transpose(k.dim()-1, k.dim()-2) / (k.size(k.dim()-1) ** 0.5)  # (B, nh, T, Ch) @ (B, nh, Ch, T) -> (B, nh, T, T)
+        qkT_masked = qkT.masked_fill(self.tril[:, :, :T, :T] == 0, float("-inf"))
+        weights = F.softmax(qkT_masked, dim=qkT_masked.dim()-1) 
+        x = weights@v # (B, nh, T, T) @ (B, nh, T, Ch) -> (B, nh, T, Ch)
+        x = x.transpose(1,2).contiguous().view(B, T, C)
+        x = self.project(x)
+        return x
+
+
 
 
 
@@ -100,10 +124,13 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, efficient=True):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embed)
-        self.mha = MultiHeadAttention(config)
+        if not efficient:
+            self.mha = MultiHeadAttention(config)
+        else:
+            self.mha = CausalMultiHeadAttention(config)
         self.mlp = MLP(config)
         self.ln_2 = nn.LayerNorm(config.n_embed)
 
@@ -177,8 +204,9 @@ def get_eval_loss(model):
         logits, loss = model(X, Y)
         losses[i] = loss
 
-    losses.mean()
+    loss = losses.mean()
     model.train()
+    return loss
 
 
 gpt_config = GPTConfig()
