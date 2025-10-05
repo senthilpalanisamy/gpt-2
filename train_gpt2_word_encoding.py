@@ -196,21 +196,75 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     model_sd_dict[key].copy_(model_hf_dict[key])
         return model
+
+class DataLoaderManual:
+    def __init__(self, B, T, filename='input.txt'):
+        with open(filename) as file:
+            data = file.read()
+        tokenizer = tiktoken.get_encoding('gpt2')
+        self.tokens = torch.tensor(tokenizer.encode(data))
+        self.B = B
+        self.T = T
+        self.pointer = 0
+
+    def next_batch(self):
+        next_tokens = self.tokens[self.pointer:self.pointer+self.B * self.T +1]
+        next_x = next_tokens[:-1]
+        next_y = next_tokens[1:]
+
+        if self.pointer + self.B * self.T +1 < len(self.tokens):
+            self.pointer = self.pointer + self.B * self.T
+        else:
+            self.pointer = 0
+        return x, y
+
+
             
 
         
 
 if __name__=='__main__':
-    model = GPT.from_pretrained('gpt2')
+    #model = GPT.from_pretrained('gpt2')
+    model = GPT(GPTConfig())
     model.eval()
     model.to('cuda')
-    batch_size = 5
+    batch_size = 4
     max_length = 55
-
+    B = batch_size
+    T = 32
     enc = tiktoken.get_encoding('gpt2')
+    if torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+   
+
+    with open('input.txt') as file:
+        data = file.read()
+    sliced_data = data[:1000]
+    tokens = enc.encode(sliced_data)
+    sliced_tokens = torch.tensor(tokens[:B*T+1])
+    x = sliced_tokens[:-1].view(B, T).to(device)
+    y = sliced_tokens[1:].view(B,T).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    dataloader = DataLoaderManual(B = B, T = T)
+
+    for i in range(50):
+        x, y = dataloader.next_batch()
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f'loss: {loss.item()}')
+        
+
     tokens = enc.encode('Hello! I am a language model')
     tokens = torch.tensor(tokens, dtype=torch.long) # T
-    x = tokens.unsqueeze(0).repeat(batch_size, 1).to('cuda') # (B, T)
+    x = tokens.unsqueeze(0).repeat(batch_size, 1).to(device) # (B, T)
 
 
     torch.manual_seed(42)
