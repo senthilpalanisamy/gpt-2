@@ -1,8 +1,16 @@
 from tqdm import tqdm
+import tiktoken
+import time
+import math
+import os
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.distributed as dist
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 from dataclasses import dataclass
 dropout = 0.2
@@ -34,6 +42,14 @@ class GPTConfig:
     n_head: int = 6
     n_embed: int = 384
 
+@dataclass
+class GPTConfigWordEmbedding:
+    block_size: int = 1024
+    vocab_size: int = 50304
+    n_layer: int = 12
+    n_head: int = 12
+    n_embed: int = 768
+
 
 def get_batch(split):
     config = GPTConfig()
@@ -46,7 +62,7 @@ def get_batch(split):
     x, y = X.to(device), Y.to(device)
     return x, y
 
-
+FLASH_ATTENTION=1
 class CausalMultiHeadAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -54,6 +70,7 @@ class CausalMultiHeadAttention(nn.Module):
         self.ns = config.n_head
         self.register_buffer('tril', torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
         self.project = nn.Linear(config.n_embed, config.n_embed)
+        self.project.IS_RESIDUAL_INPUT = True
 
     def forward(self, x):
         B, T, C = x.size()
@@ -62,14 +79,16 @@ class CausalMultiHeadAttention(nn.Module):
         q = q.view(B, T, self.ns, C // self.ns).transpose(1, 2)
         k = k.view(B, T, self.ns, C // self.ns).transpose(1, 2)
         v = v.view(B, T, self.ns, C // self.ns).transpose(1, 2)
-        qkT = q@k.transpose(k.dim()-1, k.dim()-2) / (k.size(k.dim()-1) ** 0.5)  # (B, nh, T, Ch) @ (B, nh, Ch, T) -> (B, nh, T, T)
-        qkT_masked = qkT.masked_fill(self.tril[:, :, :T, :T] == 0, float("-inf"))
-        weights = F.softmax(qkT_masked, dim=qkT_masked.dim()-1) 
-        x = weights@v # (B, nh, T, T) @ (B, nh, T, Ch) -> (B, nh, T, Ch)
+        if FLASH_ATTENTION:
+            x = F.scaled_dot_product_attention(q, k, v, is_causal = True)
+        else:
+            qkT = q@k.transpose(k.dim()-1, k.dim()-2) / (k.size(k.dim()-1) ** 0.5)  # (B, nh, T, Ch) @ (B, nh, Ch, T) -> (B, nh, T, T)
+            qkT_masked = qkT.masked_fill(self.tril[:, :, :T, :T] == 0, float("-inf"))
+            weights = F.softmax(qkT_masked, dim=qkT_masked.dim()-1) 
+            x = weights@v # (B, nh, T, T) @ (B, nh, T, Ch) -> (B, nh, T, Ch)
         x = x.transpose(1,2).contiguous().view(B, T, C)
         x = self.project(x)
         return x
-
 
 
 
@@ -132,6 +151,7 @@ class Block(nn.Module):
         else:
             self.mha = CausalMultiHeadAttention(config)
         self.mlp = MLP(config)
+        self.mlp.IS_RESIDUAL_INPUT = True
         self.ln_2 = nn.LayerNorm(config.n_embed)
 
     def forward(self, x):
@@ -153,14 +173,19 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embed)
             ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.wte.weight
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+            if hasattr(module, 'IS_RESIDUAL_INPUT'): 
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 * (self.config.n_layer * 2)**(-0.5))
+            else:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.nomal_(module.weight, mean=0.0, std=0.2)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x, targets=None):
         # x (B, T)
@@ -195,6 +220,18 @@ class GPT(nn.Module):
              idx = torch.cat([idx, idx_next], dim=idx.dim()-1)
         return idx
 
+    def configure_optimizer(self, weight_decay, learning_rate, device):
+        decay_group = [parameter for name, parameter in self.named_parameters() if parameter.dim() >= 2 and parameter.requires_grad]
+        non_decay_group = [parameter for name, parameter in self.named_parameters() if parameter.dim() < 2 and parameter.requires_grad]
+        optim_groups = [
+                {'params': decay_group, 'decay': weight_decay},
+                {'params': non_decay_group, 'decay': 0.0}
+        ]
+        num_decay_params = sum([p.numel() for p in decay_group])
+        num_non_decay_params = sum([p.numel() for p in non_decay_group])
+        print(f'decay parameters: {num_decay_params}, non_decay_params: {num_non_decay_params}')
+        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=True)
+
 @torch.no_grad()
 def get_eval_loss(model):
     model.eval()
@@ -209,29 +246,193 @@ def get_eval_loss(model):
     return loss
 
 
-gpt_config = GPTConfig()
-gpt_config.vocab_size = len(characters)
-model = GPT(gpt_config).to(device) 
-print(sum([parameter.numel() for parameter in model.parameters()]) / 1e6, 'M parameters')
+# gpt_config = GPTConfig()
+# gpt_config.vocab_size = len(characters)
+# model = GPT(gpt_config).to(device) 
+# print(sum([parameter.numel() for parameter in model.parameters()]) / 1e6, 'M parameters')
+# 
+# optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# for i in tqdm(range(max_iter)):
+#     if i % eval_iter == 0 or i == max_iter-1:
+#         loss = get_eval_loss(model)
+#         print(f'############################')
+#         print(f'eval loss is {loss}')
+#         print('#############################')
+#         print(f'generating')
+#         idx = torch.zeros((1,1), dtype = torch.long, device = device)
+#         new_tokens = model.generate(idx, max_new_tokens=500)
+#         decoded_tokens = decode(new_tokens[0].tolist())
+#         print(decoded_tokens)
+#     x, y = get_batch('train')
+#     logits, loss = model(x, y)
+#     optimizer.zero_grad()
+#     loss.backward()
+#     optimizer.step()
+#     print(f'training loss is {loss}')
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-for i in tqdm(range(max_iter)):
-    if i % eval_iter == 0 or i == max_iter-1:
-        loss = get_eval_loss(model)
-        print(f'############################')
-        print(f'eval loss is {loss}')
-        print('#############################')
-        print(f'generating')
-        idx = torch.zeros((1,1), dtype = torch.long, device = device)
-        new_tokens = model.generate(idx, max_new_tokens=500)
-        decoded_tokens = decode(new_tokens[0].tolist())
-        print(decoded_tokens)
-    x, y = get_batch('train')
-    logits, loss = model(x, y)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    print(f'training loss is {loss}')
+class DataLoaderManual:
+    def __init__(self, B, T, local_rank, world_size, filename='input.txt'):
+        with open(filename) as file:
+            data = file.read()
+        tokenizer = tiktoken.get_encoding('gpt2')
+        self.tokens = torch.tensor(tokenizer.encode(data))
+        self.B = B
+        self.T = T
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.pointer = self.local_rank * self.B * self.T
+
+    def next_batch(self):
+        next_tokens = self.tokens[self.pointer:self.pointer+self.B * self.T +1]
+        next_x = next_tokens[:-1]
+        next_y = next_tokens[1:]
+        self.pointer = self.pointer + self.B * self.T * self.world_size
+
+        if self.pointer + self.B * self.T +1 > len(self.tokens):
+            self.pointer = self.local_rank * self.B * self.T
+        # print(f'{self.pointer}, {len(self.tokens)}')
+        return next_x.view(self.B, self.T), next_y.view(self.B, self.T)
+
+
+def get_lr(step,  max_lr=6e-4, warmup_steps=10, max_steps=1000):
+    min_lr = max_lr * 0.1
+    if step < warmup_steps:
+        return (step+1) / warmup_steps * max_lr
+
+    if step > max_steps:
+        return min_lr
+
+    decay_weight = (step+1) / (max_steps-warmup_steps)
+    cosine_weight = 0.5 * (1+math.cos(decay_weight * math.pi))
+    return min_lr + (max_lr - min_lr) * cosine_weight
+
+
+            
+
+        
+
+if __name__=='__main__':
+
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    if ddp:
+        assert torch.cuda.is_available(), 'cuda is needed for ddp'
+        rank = os.environ.get('RANK')
+        init_process_group(backend='nccl')
+        local_rank = int(os.environ.get('LOCAL_RANK'))
+        world_size = int(os.environ.get('WORLD_SIZE'))
+        device = f'cuda:{local_rank}'
+        torch.cuda.set_device(device)
+        master = local_rank == 0
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        master = True
+
+    #model = GPT.from_pretrained('gpt2')
+    model = GPT(GPTConfigWordEmbedding())
+    model.eval()
+    model.to('cuda')
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
+
+    batch_size = 16
+    max_length = 55
+    B = batch_size
+    T = 32
+    enc = tiktoken.get_encoding('gpt2')
+    if torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+   
+
+    # with open('input.txt') as file:
+    #     data = file.read()
+    # sliced_data = data[:1000]
+    # tokens = enc.encode(sliced_data)
+    # sliced_tokens = torch.tensor(tokens[:B*T+1])
+    # x = sliced_tokens[:-1].view(B, T).to(device)
+    # y = sliced_tokens[1:].view(B,T).to(device)
+
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    raw_model = model.module if ddp else model
+    optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device = device)
+    dataloader = DataLoaderManual(B = B, T = T, local_rank = local_rank, world_size = world_size)
+    torch.set_float32_matmul_precision('high')
+    model = torch.compile(model)
+    max_steps = 10000
+    total_batch_size = 524288
+    grad_accum_steps = total_batch_size // (B * T * world_size)
+
+    for i in range(max_steps):
+        t0 = time.time()
+        optimizer.zero_grad()
+        total_loss = 0.0
+
+        for j in range(grad_accum_steps):
+            x, y = dataloader.next_batch()
+            x = x.to(device)
+            y = y.to(device)
+            with torch.autocast(device_type = device, dtype = torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accum_steps
+            loss.backward()
+            if ddp:
+                model.require_backward_grad_sync = (j == grad_accum_steps-1)
+            total_loss += loss.detach()
+
+        if ddp:
+            dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
+
+        lr = get_lr(i, max_steps=max_steps)
+        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        torch.cuda.synchronize()
+        t1 = time.time()
+        tokens_per_second = B * T  * grad_accum_steps * world_size / (t1-t0)
+        if master:
+            print(f'loss: {total_loss.item()}')
+            print(f'time: {(t1 - t0)*1000}')
+            print(f'tokens per second: {tokens_per_second}')
+            print(f'graident norm: {norm}')
+    if ddp:
+        destroy_process_group()
+        
+
+    tokens = enc.encode('Hello! I am a language model')
+    tokens = torch.tensor(tokens, dtype=torch.long) # T
+    x = tokens.unsqueeze(0).repeat(batch_size, 1).to(device) # (B, T)
+
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+
+    with torch.no_grad():
+        while x.size(1) < max_length:
+            logits, _ = model(x) # (B, T, V)
+            B, T, V = logits.shape
+            logits = logits[:, T-1, :] # (B, V) 
+            probs = F.softmax(logits, dim=1) # (B, V)
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=1) # (B, 50)
+            sampled_index = torch.multinomial(topk_probs, 1) # (B, 1)
+            pred_x = torch.gather(topk_indices, 1, sampled_index)
+            x = torch.cat((x, pred_x), dim=1)
+
+
+        for i in range(batch_size):
+            decoded = enc.decode(x[i,:].tolist())
+            print('#############################')
+            print(decoded)
+
+
+
+
 
 
 

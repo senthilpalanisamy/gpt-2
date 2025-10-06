@@ -1,0 +1,6 @@
+Timings on g5.2x large for B=32 and T=16
+base                      : 52 ms 
+after changing to bfloat16: 46 ms
+after compiling model     : 38 ms
+after FLASH attention     : 38 ms (may be new versions auto optimize)
+after changing vocab size : 37.8 ms (may be newer versions are optimized)
