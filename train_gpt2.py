@@ -539,6 +539,7 @@ if __name__=='__main__':
             print(f'graident norm: {norm}')
             writer.add_scalar('loss/train', total_loss, i)
             writer.add_scalar('learning_rate', lr, i)
+            writer.add_scalar('grad_norm', norm, i)
 
         if args.save_frequency > 0 and ((i % args.save_frequency == 0) or (i == max_steps-1)) and master:
             torch.save(raw_model, f'{model_dir}/model_{i}.pth')
