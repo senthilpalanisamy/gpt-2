@@ -10,6 +10,9 @@ from torch.nn import functional as F
 import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+from pathlib import Path
 
 
 from dataclasses import dataclass
@@ -293,6 +296,65 @@ class DataLoaderManual:
         # print(f'{self.pointer}, {len(self.tokens)}')
         return next_x.view(self.B, self.T), next_y.view(self.B, self.T)
 
+def get_token_count_in_shard(shard_path):
+    with open(shard_path, 'rb') as file:
+        buffer = file.read(256 * 4)
+        header_info = np.frombuffer(buffer,  dtype=np.int32)
+        assert header_info[0] == 20240520, 'header info magic number mismatch'
+        assert header_info[1] == 1, 'version mismatch'
+        ntok = header_info[2]
+        tokens = np.frombuffer(file.read(), dtype=np.int16)
+        assert ntok == len(tokens), 'header token count info and number of tokens mismatch'
+    return ntok
+
+def load_shard(shard_path):
+    with open(shard_path, 'rb') as file:
+        buffer = file.read(256 * 4)
+        header_info = np.frombuffer(buffer,  dtype=np.int32)
+        assert header_info[0] == 20240520, 'header info magic number mismatch'
+        assert header_info[1] == 1, 'version mismatch'
+        ntok = header_info[2]
+        tokens = np.frombuffer(file.read(), dtype=np.int16)
+        assert ntok == len(tokens), 'header token count info and number of tokens mismatch'
+    return tokens
+
+class DataLoaderFineWeb:
+    def __init__(self, B, T, local_rank, world_size, split):
+        self.B = B
+        self.T = T
+        self.local_rank = local_rank
+        self.world_size = world_size
+        dataset_basepath = 'fineweb10B'
+        shards = os.listdir(dataset_basepath)
+        filtered_sorted_shards = [s for s in sorted(shards) if split in s]
+        self.shard_paths = [os.path.join(dataset_basepath, shard_name) for shard_name in filtered_sorted_shards]
+        self.shard_pointer = None
+        self.tokens = None
+        self.current_position = None
+
+    def reset(self):
+        if self.shard_pointer != 0:
+            self.shard_pointer = 0
+            self.tokens = load_shard(self.shard_paths[self.shard_pointer])
+        self.current_position = self.local_rank * B * T
+
+    def advance(self):
+        self.shard_pointer = (self.shard_pointer + 1) % len(self.shard_paths)
+        self.tokens = load_shard(self.shard_paths[self.shard_pointer])
+        self.current_position = self.local_rank * B * T
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buff = self.tokens[self.current_position: self.current_position + B * T + 1]
+        buff = torch.tensor(buff.astype(np.int32), dtype = torch.long)
+        x = buff[:-1]
+        y = buff[1:]
+        self.current_position += B * T * self.world_size
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.advance()
+        return x.view(B, T), y.view(B, T)
+        
+
 
 def get_lr(step,  max_lr=6e-4, warmup_steps=10, max_steps=1000):
     min_lr = max_lr * 0.1
@@ -312,6 +374,17 @@ def get_lr(step,  max_lr=6e-4, warmup_steps=10, max_steps=1000):
         
 
 if __name__=='__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--experiment_name', type=str)
+    parser.add_argument('--dataset_type', type=str, default='fineweb')
+    parser.add_argument('--val_frequency', type=int, default=100)
+    parser.add_argument('--max_val_steps', type=int, default=20)
+    parser.add_argument('--sample_frequency', type=int, default=200)
+    parser.add_argument('--save_frequency', type=int, default=50)
+    args = parser.parse_args()
+
+    best_val_loss = float('inf')
 
     ddp = int(os.environ.get('RANK', -1)) != -1
     if ddp:
@@ -328,6 +401,9 @@ if __name__=='__main__':
         local_rank = 0
         world_size = 1
         master = True
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
 
     #model = GPT.from_pretrained('gpt2')
     model = GPT(GPTConfigWordEmbedding())
@@ -360,20 +436,81 @@ if __name__=='__main__':
 
     raw_model = model.module if ddp else model
     optimizer = raw_model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device = device)
-    dataloader = DataLoaderManual(B = B, T = T, local_rank = local_rank, world_size = world_size)
+    if args.dataset_type == 'fineweb':
+        train_dataloader = DataLoaderFineWeb(B = B, T = T, local_rank = local_rank, world_size = world_size, split='train')
+        val_dataloader = DataLoaderFineWeb(B = B, T = T, local_rank = local_rank, world_size = world_size, split='val')
+        train_dataloader.reset()
+    else:
+        # shakespeare dataset
+        # val_dataloader doesn't have a reset, might not work fully well
+        train_dataloader = DataLoaderManual(B = B, T = T, local_rank = local_rank, world_size = world_size)
+        val_dataloader = DataLoaderManual(B = B, T = T, local_rank = local_rank, world_size = world_size)
+        
     torch.set_float32_matmul_precision('high')
     model = torch.compile(model)
     max_steps = 10000
     total_batch_size = 524288
     grad_accum_steps = total_batch_size // (B * T * world_size)
+    base_dir = f'runs/{args.experiment_name}'
+    model_dir = f'{base_dir}/models'
+    
+    if master:
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+        Path(model_dir).mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(base_dir)
 
     for i in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
         total_loss = 0.0
 
+        if args.val_frequency > 0 and ((i % args.val_frequency == 0) or (i == max_steps-1)):
+            model.eval()
+            val_dataloader.reset()
+            total_val_loss = 0.0
+            with torch.no_grad():
+                for _ in range(args.max_val_steps):
+                    x, y = val_dataloader.next_batch()
+                    x = x.to(device)
+                    y = y.to(device)
+                    logits, loss = model(x, y)
+                    total_val_loss += loss.item()
+                total_val_loss = total_val_loss / args.max_val_steps
+                if master:
+                    writer.add_scalar('loss/val', total_val_loss, i)
+                    if total_val_loss < best_val_loss:
+                        best_val_loss  = total_val_loss
+                        torch.save(raw_model, f'{model_dir}/best_model.pth')
+                    print(f'#############val loss:{total_val_loss}')
+
+
+        if args.sample_frequency > 0 and ((i % args.sample_frequency == 0) or (i==max_steps-1)) and master:
+            model.eval()
+            tokens = enc.encode('Hello! I am a language model')
+            tokens = torch.tensor(tokens, dtype=torch.long) # T
+            x = tokens.unsqueeze(0).repeat(batch_size, 1).to(device) # (B, T)
+
+            with torch.no_grad():
+                while x.size(1) < max_length:
+                    logits, _ = model(x) # (B, T, V)
+                    B, T, V = logits.shape
+                    logits = logits[:, T-1, :] # (B, V) 
+                    probs = F.softmax(logits, dim=1) # (B, V)
+                    topk_probs, topk_indices = torch.topk(probs, 50, dim=1) # (B, 50)
+                    sampled_index = torch.multinomial(topk_probs, 1) # (B, 1)
+                    pred_x = torch.gather(topk_indices, 1, sampled_index)
+                    x = torch.cat((x, pred_x), dim=1)
+
+
+                for i in range(batch_size):
+                    decoded = enc.decode(x[i,:].tolist())
+                    print('#############################')
+                    print(decoded)
+
+
+        model.train()
         for j in range(grad_accum_steps):
-            x, y = dataloader.next_batch()
+            x, y = train_dataloader.next_batch()
             x = x.to(device)
             y = y.to(device)
             with torch.autocast(device_type = device, dtype = torch.bfloat16):
@@ -400,35 +537,14 @@ if __name__=='__main__':
             print(f'time: {(t1 - t0)*1000}')
             print(f'tokens per second: {tokens_per_second}')
             print(f'graident norm: {norm}')
+            writer.add_scalar('loss/train', total_loss, i)
+            writer.add_scalar('learning_rate', lr, i)
+
+        if args.save_frequency > 0 and ((i % args.save_frequency == 0) or (i == max_steps-1)) and master:
+            torch.save(raw_model, f'{model_dir}/model_{i}.pth')
     if ddp:
         destroy_process_group()
         
-
-    tokens = enc.encode('Hello! I am a language model')
-    tokens = torch.tensor(tokens, dtype=torch.long) # T
-    x = tokens.unsqueeze(0).repeat(batch_size, 1).to(device) # (B, T)
-
-
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-
-    with torch.no_grad():
-        while x.size(1) < max_length:
-            logits, _ = model(x) # (B, T, V)
-            B, T, V = logits.shape
-            logits = logits[:, T-1, :] # (B, V) 
-            probs = F.softmax(logits, dim=1) # (B, V)
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=1) # (B, 50)
-            sampled_index = torch.multinomial(topk_probs, 1) # (B, 1)
-            pred_x = torch.gather(topk_indices, 1, sampled_index)
-            x = torch.cat((x, pred_x), dim=1)
-
-
-        for i in range(batch_size):
-            decoded = enc.decode(x[i,:].tolist())
-            print('#############################')
-            print(decoded)
 
 
 
