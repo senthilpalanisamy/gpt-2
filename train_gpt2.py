@@ -382,6 +382,8 @@ if __name__=='__main__':
     parser.add_argument('--max_val_steps', type=int, default=20)
     parser.add_argument('--sample_frequency', type=int, default=200)
     parser.add_argument('--save_frequency', type=int, default=50)
+    parser.add_argument('--warmup_steps', type=int, default=50)
+    parser.add_argument('--max_steps', type=int, default=10000)
     args = parser.parse_args()
 
     best_val_loss = float('inf')
@@ -524,7 +526,7 @@ if __name__=='__main__':
         if ddp:
             dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
 
-        lr = get_lr(i, max_steps=max_steps)
+        lr = get_lr(i, warmup_steps= args.warmup_steps, max_steps=args.max_steps)
         norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
