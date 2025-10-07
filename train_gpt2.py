@@ -384,6 +384,8 @@ if __name__=='__main__':
     parser.add_argument('--save_frequency', type=int, default=50)
     parser.add_argument('--warmup_steps', type=int, default=50)
     parser.add_argument('--max_steps', type=int, default=10000)
+    parser.add_argument('--compile', type=bool, default=False)
+
     args = parser.parse_args()
 
     best_val_loss = float('inf')
@@ -418,7 +420,7 @@ if __name__=='__main__':
     batch_size = 16
     max_length = 55
     B = batch_size
-    T = 32
+    T = 1024
     enc = tiktoken.get_encoding('gpt2')
     if torch.cuda.is_available():
         device = 'cuda'
@@ -449,8 +451,9 @@ if __name__=='__main__':
         val_dataloader = DataLoaderManual(B = B, T = T, local_rank = local_rank, world_size = world_size)
         
     torch.set_float32_matmul_precision('high')
-    model = torch.compile(model)
-    max_steps = 10000
+    if args.compile:
+        model = torch.compile(model)
+    max_steps = args.max_steps
     total_batch_size = 524288
     grad_accum_steps = total_batch_size // (B * T * world_size)
     base_dir = f'runs/{args.experiment_name}'
