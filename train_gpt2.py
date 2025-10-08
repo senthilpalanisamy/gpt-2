@@ -418,7 +418,7 @@ if __name__=='__main__':
     batch_size = 16
     max_length = 55
     B = batch_size
-    T = 32
+    T = 1024
     enc = tiktoken.get_encoding('gpt2')
     if torch.cuda.is_available():
         device = 'cuda'
@@ -461,12 +461,12 @@ if __name__=='__main__':
         Path(model_dir).mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(base_dir)
 
-    for i in range(max_steps):
+    for step_count in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
         total_loss = 0.0
 
-        if args.val_frequency > 0 and ((i % args.val_frequency == 0) or (i == max_steps-1)):
+        if args.val_frequency > 0 and ((step_count % args.val_frequency == 0) or (step_count == max_steps-1)):
             model.eval()
             val_dataloader.reset()
             total_val_loss = 0.0
@@ -479,14 +479,14 @@ if __name__=='__main__':
                     total_val_loss += loss.item()
                 total_val_loss = total_val_loss / args.max_val_steps
                 if master:
-                    writer.add_scalar('loss/val', total_val_loss, i)
+                    writer.add_scalar('loss/val', total_val_loss, step_count)
                     if total_val_loss < best_val_loss:
                         best_val_loss  = total_val_loss
                         torch.save(raw_model, f'{model_dir}/best_model.pth')
                     print(f'#############val loss:{total_val_loss}')
 
 
-        if args.sample_frequency > 0 and ((i % args.sample_frequency == 0) or (i==max_steps-1)) and master:
+        if args.sample_frequency > 0 and ((step_count % args.sample_frequency == 0) or (step_count ==max_steps-1)) and master:
             model.eval()
             tokens = enc.encode('Hello! I am a language model')
             tokens = torch.tensor(tokens, dtype=torch.long) # T
@@ -526,7 +526,7 @@ if __name__=='__main__':
         if ddp:
             dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
 
-        lr = get_lr(i, warmup_steps= args.warmup_steps, max_steps=args.max_steps)
+        lr = get_lr(step_count, warmup_steps= args.warmup_steps, max_steps=args.max_steps)
         norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -539,11 +539,11 @@ if __name__=='__main__':
             print(f'time: {(t1 - t0)*1000}')
             print(f'tokens per second: {tokens_per_second}')
             print(f'graident norm: {norm}')
-            writer.add_scalar('loss/train', total_loss, i)
-            writer.add_scalar('learning_rate', lr, i)
-            writer.add_scalar('grad_norm', norm, i)
+            writer.add_scalar('loss/train', total_loss, step_count)
+            writer.add_scalar('learning_rate', lr, step_count)
+            writer.add_scalar('grad_norm', norm, step_count)
 
-        if args.save_frequency > 0 and ((i % args.save_frequency == 0) or (i == max_steps-1)) and master:
+        if args.save_frequency > 0 and ((step_count % args.save_frequency == 0) or (step_count == max_steps-1)) and master:
             torch.save(raw_model, f'{model_dir}/model_{i}.pth')
     if ddp:
         destroy_process_group()
